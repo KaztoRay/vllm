@@ -650,6 +650,13 @@ class BenchmarkWorker:
                 except triton.runtime.autotuner.OutOfResources:
                     # Some configurations may be invalid and fail to compile.
                     continue
+                except RuntimeError as exc:
+                    # Triton can reject otherwise shape-compatible candidates
+                    # while lowering the generated MLIR. Treat only this known
+                    # compiler rejection as an invalid tuning candidate.
+                    if "PassManager::run failed" not in str(exc):
+                        raise
+                    continue
 
                 if kernel_time < best_time:
                     best_time = kernel_time
@@ -771,6 +778,7 @@ def get_model_params(config):
         "Glm4MoeLiteForCausalLM",
         "NemotronHForCausalLM",
         "MistralLarge3ForCausalLM",
+        "SolarOpen2ForCausalLM",
     ):
         E = config.n_routed_experts
         topk = config.num_experts_per_tok

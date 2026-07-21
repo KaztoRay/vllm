@@ -107,6 +107,10 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> None:
         super().__init__(config, vllm_config, prefix)
 
+        # Flipped True after the first V1 profile run warms up the autotuned KDA
+        # prefill kernels (see _warmup_prefill_kernels / _forward profile branch).
+        self._prefill_kernels_warmed_up = False
+
         kda_config = config.linear_attn_config  # type: ignore[attr-defined]
         assert kda_config is not None, "linear_attn_config must be set"
         self.head_dim = kda_config["head_dim"]
@@ -268,6 +272,87 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
         output[:] = self.o_proj(core_attn_out)[0]
 
+    def _warmup_prefill_kernels(
+        self,
+        q_proj_states: torch.Tensor,
+        k_proj_states: torch.Tensor,
+        v_proj_states: torch.Tensor,
+        g1: torch.Tensor,
+        beta: torch.Tensor,
+    ) -> None:
+        """Force-autotune the chunked-prefill KDA Triton kernels during the V1
+        profile run, while GPU memory is still plentiful.
+
+        ``chunk_kda`` fans out to several ``@triton.autotune`` kernels
+        (``chunk_kda_scaled_dot_kkt``, ``solve_tril``, ``recompute_w_u``,
+        ``chunk_gla``/``chunk_gated_delta_rule`` ...). Because the profile run
+        returns early (``attn_metadata is None``), their autotuner caches are
+        empty when the first real request arrives, so it JIT-autotunes them
+        inside the forward pass. With TP>1 that per-rank autotuning desyncs the
+        ranks at the following all-reduce and the collective aborts -- and under
+        CUDA forward-compat (older driver, slower kernel compile/load) it
+        reliably crashes the engine. Running one chunk (T=64) here populates
+        every autotuner cache (results are cached globally, so only the first
+        layer pays the benchmarking cost) so the first real prefill is JIT-free.
+        Analogous to ``QwenGatedDeltaNetAttention._warmup_prefill_kernels``.
+
+        The incoming tensors already carry the exact dtypes/shapes of the real
+        prefill inputs (``forward`` computed them before the op was invoked), so
+        we slice them to one chunk rather than fabricating dummies.
+        """
+        if self._prefill_kernels_warmed_up:
+            return
+        self._prefill_kernels_warmed_up = True
+
+        T = 64  # FLA chunk size; a single chunk keys every autotuner cache.
+        if q_proj_states.size(0) < T:
+            return
+
+        try:
+            q, k, v = [
+                rearrange(x[:T], "n (h d) -> 1 n h d", d=self.head_dim)
+                for x in (q_proj_states, k_proj_states, v_proj_states)
+            ]
+            *_, state_dtype = self.get_state_dtype()
+            initial_state = torch.zeros(
+                1,
+                self.local_num_heads,
+                self.head_dim,
+                self.head_dim,
+                device=q.device,
+                dtype=state_dtype,
+            )
+            cu_seqlens = torch.tensor([0, T], device=q.device, dtype=torch.int32)
+            # Quiesce the device before and after autotuning. The profile forward
+            # leaves prior ops in flight; concurrently autotuning the KDA
+            # chunked-prefill kernels across TP ranks from a non-quiescent state
+            # intermittently faults under CUDA forward-compat. Bracketing the call
+            # with syncs makes the warmup deterministic.
+            torch.accelerator.synchronize()
+            chunk_kda(
+                q=q,
+                k=k,
+                v=v,
+                g=g1[:, :T],
+                beta=beta[:, :T],
+                initial_state=initial_state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+                cu_seqlens=cu_seqlens,
+            )
+            torch.accelerator.synchronize()
+        except Exception:
+            logger.warning(
+                "KDA prefill-kernel warmup (T=%d) failed for layer %s; the first "
+                "real request may JIT-autotune and stall/crash under CUDA "
+                "forward-compat.",
+                T,
+                self.prefix,
+                exc_info=True,
+            )
+        finally:
+            torch.accelerator.empty_cache()
+
     def _forward(
         self,
         q_proj_states: torch.Tensor,
@@ -281,7 +366,16 @@ class KimiGatedDeltaNetAttention(GatedDeltaNetAttention):
         attn_metadata_raw = forward_context.attn_metadata
 
         if attn_metadata_raw is None:
-            #     # V1 profile run
+            # V1 profile run: attn_metadata is None, so the real prefill below
+            # (chunk_kda + its autotuned Triton sub-kernels) never runs and the
+            # autotuner cache stays empty. The first real request would then
+            # JIT-autotune those kernels mid-forward; with TP>1 the per-rank
+            # autotuning desyncs the ranks across the next all-reduce and the
+            # collective aborts -- fatal under CUDA forward-compat. Warm them up
+            # now while memory is plentiful. See _warmup_prefill_kernels.
+            self._warmup_prefill_kernels(
+                q_proj_states, k_proj_states, v_proj_states, g1, beta
+            )
             return
 
         assert isinstance(attn_metadata_raw, dict)
